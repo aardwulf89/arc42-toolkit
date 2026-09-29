@@ -13,6 +13,7 @@
 #      (en, de, fr, it, es, pt — or any language file you added)
 #
 # No Python dependencies to install — the linter uses stdlib only.
+# (It uses markdown-it-py for table parsing if the runner has it, but never needs it.)
 # ubuntu-latest ships Python 3.12+, so no setup-python step is needed.
 # ============================================================
 

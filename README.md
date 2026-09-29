@@ -147,7 +147,7 @@ arc42-toolkit/
 │   └── arc42-lint/SKILL.md            # Cross-section consistency linter
 │
 ├── scripts/
-│   ├── arc42-lint.py                  # Standalone linter (stdlib only, CI-ready)
+│   ├── arc42-lint.py                  # Standalone linter (stdlib only, CI-ready; markdown-it-py optional)
 │   └── languages/
 │       ├── en.json                    # English (default)
 │       ├── de.json                    # Deutsch
@@ -331,11 +331,13 @@ python scripts/arc42-lint.py --strict
 
 Exit code `0` = clean, `1` = issues found.
 
+The linter reads table cells as plain text, so inline formatting such as `` `IF-01` ``, `**Order Service**` or `[IF-02](#if-02)` is handled. It uses [markdown-it-py](https://github.com/executablebooks/markdown-it-py) for this when installed, and a builtin stdlib reader following the same GitHub table rules otherwise. With [uv](https://docs.astral.sh/uv/), `uv run scripts/arc42-lint.py` fetches markdown-it-py automatically from the script's inline metadata. Use `--parser builtin` or `--parser markdown-it` to force one.
+
 ### GitHub Actions
 
 Copy `templates/arc42-lint.yml` from this repo to `.github/workflows/arc42-lint.yml` in your project. It runs automatically when files under `docs/**` change.
 
-**To use in your own project:** copy the entire `scripts/` directory (script + languages) and `templates/arc42-lint.yml` (to `.github/workflows/arc42-lint.yml`) into your repo. No Python dependencies to install — stdlib only.
+**To use in your own project:** copy the entire `scripts/` directory (script + languages) and `templates/arc42-lint.yml` (to `.github/workflows/arc42-lint.yml`) into your repo. No Python dependencies to install — stdlib only (markdown-it-py is used when available, never required).
 
 ### Adding a language
 

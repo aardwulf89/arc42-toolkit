@@ -112,8 +112,10 @@ skills/                           # Canonical skill source (agentskills.io spec)
 │   arc42-lint/SKILL.md           # Cross-section consistency linter
 .agents/ -> skills/               # Symlink for agent-discovery compatibility
 scripts/
-│   arc42-lint.py                 # Standalone linter script (stdlib only)
+│   arc42-lint.py                 # Standalone linter script (stdlib only; markdown-it-py optional)
 │   languages/                    # Language definitions (en, de, fr, it, es, pt)
+tests/
+│   test_arc42_lint.py            # Linter tests (stdlib unittest) + fixtures/
 templates/
 │   arc42-lint.yml                # GitHub Actions workflow template (copy to your project)
 ```

@@ -10,6 +10,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). Eac
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+| Artifact | Change |
+|---|---|
+| `scripts/arc42-lint.py` | Table cells are read as plain text through a shared table reader: markdown-it-py when importable (declared as PEP 723 inline metadata, so `uv run` provides it), otherwise a builtin stdlib reader following the same GFM table rules. New `--parser auto\|markdown-it\|builtin` option; text output names the reader in use |
+
+### Fixed
+
+| Artifact | Change |
+|---|---|
+| `scripts/arc42-lint.py` | IDs, building block names and Q42 tags wrapped in inline formatting (backticks, bold, links) are no longer missed or reported as missing |
+| `scripts/arc42-lint.py` | Section 1.2 tags are found anywhere in the goal cell (e.g. `Reliability (#reliable)`), not only at its start |
+| `scripts/arc42-lint.py` | Tables inside fenced code blocks are ignored; escaped pipes (`\|`) no longer split cells |
+| `scripts/arc42-lint.py` | Section 5 building block rows whose name contains a header keyword (e.g. `Name Registry`) are no longer mistaken for header rows |
+
+### Added
+
+| Artifact | Description |
+|---|---|
+| `tests/` | Stdlib `unittest` suite with fixture docs; checks builtin and markdown-it readers produce identical results |
+
+---
+
 ## [1.1.1] — 2026-07-07
 
 ### Fixed

@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.8"
+# dependencies = ["markdown-it-py"]
+# ///
 """arc42 cross-section consistency linter.
 
 Usage:
-    python scripts/arc42-lint.py [docs_path] [--lang LANG] [--format text|github] [--strict]
+    python scripts/arc42-lint.py [docs_path] [--lang LANG] [--format text|github]
+                                 [--strict] [--parser auto|markdown-it|builtin]
 
 Exit codes:
     0  no issues (or only warnings in non-strict mode)
     1  one or more errors found (or warnings with --strict)
+    2  invalid invocation (e.g. --parser markdown-it without markdown-it-py installed)
 
 Requires Python 3.8+. Language files live in scripts/languages/ alongside this script.
 Default language is English (en). Run with --lang de, fr, it, es, or pt for
 other built-in languages, or add a new JSON file to contribute a language.
+
+Markdown tables are read with markdown-it-py when it is importable, and with a
+builtin stdlib reader otherwise. Both produce the same cell text for the table
+syntax arc42 documents use. `uv run scripts/arc42-lint.py` installs
+markdown-it-py on the fly from the inline metadata above; plain
+`python scripts/arc42-lint.py` needs no dependencies.
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:
+    from markdown_it import MarkdownIt
+except ImportError:  # optional dependency — the builtin reader is used instead
+    MarkdownIt = None
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +152,231 @@ def split_monolithic(content: str, path: Path, lang: dict) -> list[tuple[int, st
 
 
 # ---------------------------------------------------------------------------
+# Markdown tables
+# ---------------------------------------------------------------------------
+#
+# Extractors read identifiers from table cells. Cells are reduced to plain text
+# first, so `OrderService`, **OrderService** and [OrderService](#bb) all yield
+# "OrderService". Two interchangeable readers produce the same TableRow lists:
+# markdown-it-py (CommonMark + GFM tables) when installed, and a builtin
+# stdlib reader that follows the same GFM table rules.
+
+@dataclass
+class TableRow:
+    line:      int        # 1-based line number within the parsed content
+    cells:     list[str]  # plain-text cell contents, padded/truncated to the header width
+    is_header: bool
+
+
+PARSER_MARKDOWN_IT = "markdown-it"
+PARSER_BUILTIN     = "builtin"
+
+_parser = PARSER_MARKDOWN_IT if MarkdownIt is not None else PARSER_BUILTIN
+_md = None
+
+
+def set_parser(choice: str) -> str:
+    """Select the table reader ('auto', 'markdown-it' or 'builtin'); return the active one."""
+    global _parser
+    if choice == "auto":
+        _parser = PARSER_MARKDOWN_IT if MarkdownIt is not None else PARSER_BUILTIN
+    elif choice == PARSER_MARKDOWN_IT and MarkdownIt is None:
+        raise RuntimeError("markdown-it-py is not installed")
+    else:
+        _parser = choice
+    return _parser
+
+
+def parse_tables(content: str) -> list[list[TableRow]]:
+    """Return every table in content as a list of rows (header row first)."""
+    if _parser == PARSER_MARKDOWN_IT:
+        return _tables_markdown_it(content)
+    return _tables_builtin(content)
+
+
+# --- markdown-it-py reader --------------------------------------------------
+
+def _tables_markdown_it(content: str) -> list[list[TableRow]]:
+    global _md
+    if _md is None:
+        _md = MarkdownIt("commonmark").enable(["table", "strikethrough"])
+
+    tables: list[list[TableRow]] = []
+    rows: list[TableRow] = []
+    row: TableRow | None = None
+    in_head = False
+    for tok in _md.parse(content):
+        if tok.type == "table_open":
+            rows = []
+            tables.append(rows)
+        elif tok.type == "thead_open":
+            in_head = True
+        elif tok.type == "thead_close":
+            in_head = False
+        elif tok.type == "tr_open":
+            row = TableRow(tok.map[0] + 1, [], in_head)
+            rows.append(row)
+        elif tok.type == "tr_close":
+            row = None
+        elif tok.type == "inline" and row is not None:
+            row.cells.append(_plain_text(tok.children or []).strip())
+    return tables
+
+
+def _plain_text(tokens: list) -> str:
+    parts: list[str] = []
+    for tok in tokens:
+        if tok.type in ("text", "text_special", "code_inline"):
+            parts.append(tok.content)
+        elif tok.type == "image":
+            parts.append(_plain_text(tok.children or []))
+        elif tok.type in ("softbreak", "hardbreak"):
+            parts.append(" ")
+    return "".join(parts)
+
+
+# --- builtin stdlib reader --------------------------------------------------
+
+_FENCE_RE       = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_DELIM_CELL_RE  = re.compile(r"^:?-+:?$")
+# Lines that start a new block and therefore end a table body (GFM behaviour)
+_BLOCK_START_RE = re.compile(
+    r"^(?:\#{1,6}(?:\s|$)|>|[-+*]\s|\d{1,9}[.)]\s|`{3,}|~{3,}|<"
+    r"|(?:\*[ \t]*){3,}$|(?:-[ \t]*){3,}$|(?:_[ \t]*){3,}$)"
+)
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _split_row(line: str) -> list[str]:
+    """Split a table row on unescaped pipes. Code spans do not protect pipes (GFM)."""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
+
+
+def _is_delimiter_row(line: str, width: int) -> bool:
+    s = line.strip()
+    if not s or s[0] not in "|-:" or set(s) - set("|-: \t"):
+        return False
+    cells = _split_row(s)
+    return len(cells) == width and all(_DELIM_CELL_RE.match(c) for c in cells)
+
+
+def _tables_builtin(content: str) -> list[list[TableRow]]:
+    lines = content.splitlines()
+    tables: list[list[TableRow]] = []
+    fence: str | None = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        fence_m = _FENCE_RE.match(line)
+        if fence is not None:
+            if fence_m and fence_m.group(1)[0] == fence[0] and len(fence_m.group(1)) >= len(fence) \
+                    and not line.strip().lstrip(fence[0]):
+                fence = None
+            i += 1
+            continue
+        if fence_m:
+            fence = fence_m.group(1)
+            i += 1
+            continue
+
+        if re.search(r"(?<!\\)\|", line) and i + 1 < len(lines):
+            header = _split_row(line)
+            if _is_delimiter_row(lines[i + 1], len(header)):
+                table_indent = _indent(line)
+                width = len(header)
+                rows = [TableRow(i + 1, [_strip_inline(c) for c in header], True)]
+                i += 2
+                while i < len(lines):
+                    body = lines[i]
+                    if not body.strip() or _indent(body) > table_indent + 3 \
+                            or _BLOCK_START_RE.match(body.lstrip()):
+                        break
+                    cells = (_split_row(body) + [""] * width)[:width]
+                    rows.append(TableRow(i + 1, [_strip_inline(c) for c in cells], False))
+                    i += 1
+                tables.append(rows)
+                continue
+        i += 1
+    return tables
+
+
+_ASCII_PUNCT  = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+_AUTOLINK_RE  = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*|[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+)>")
+_HTML_TAG_RE  = re.compile(r"<!--.*?-->|</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
+_LINK_RE      = re.compile(r"!?\[([^\[\]]*)\]\([^()\s]*(?:\s+\"[^\"]*\")?\)")
+_ENTITY_RE    = re.compile(r"&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
+_EMPHASIS_RES = [
+    re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*"),
+    re.compile(r"(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)"),
+    re.compile(r"\*(?=\S)(.+?)(?<=\S)\*"),
+    re.compile(r"(?<!\w)_(?=\S)(.+?)(?<=\S)_(?!\w)"),
+    re.compile(r"~~(?=\S)(.+?)(?<=\S)~~"),
+]
+
+
+def _strip_inline(text: str) -> str:
+    """Reduce inline markdown to plain text, matching markdown-it's text output.
+
+    Handles backslash escapes, code spans, autolinks, inline HTML, links,
+    images, emphasis, strikethrough and entities. Literal fragments (escapes,
+    code, URLs) are swapped for placeholders so later passes cannot alter them.
+    """
+    protected: list[str] = []
+
+    def protect(s: str) -> str:
+        protected.append(s)
+        return f"\x00{len(protected) - 1}\x00"
+
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n and text[i + 1] in _ASCII_PUNCT:
+            out.append(protect(text[i + 1]))
+            i += 2
+        elif c == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            run = j - i
+            close = next((m for m in re.finditer(r"`+", text[j:]) if len(m.group()) == run), None)
+            if close is None:
+                out.append(protect(text[i:j]))
+                i = j
+            else:
+                code = text[j:j + close.start()]
+                if len(code) >= 2 and code[0] == " " and code[-1] == " " and code.strip():
+                    code = code[1:-1]
+                out.append(protect(code))
+                i = j + close.end()
+        else:
+            out.append(c)
+            i += 1
+    s = "".join(out)
+
+    s = _AUTOLINK_RE.sub(lambda m: protect(m.group(1)), s)
+    s = _HTML_TAG_RE.sub("", s)
+    previous = None
+    while previous != s:
+        previous = s
+        s = _LINK_RE.sub(r"\1", s)
+        for pattern in _EMPHASIS_RES:
+            s = pattern.sub(r"\1", s)
+    s = _ENTITY_RE.sub(lambda m: html.unescape(m.group()), s)
+    s = re.sub(r"\x00(\d+)\x00", lambda m: protected[int(m.group(1))], s)
+    return s.strip()
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
@@ -171,25 +414,30 @@ class LintIssue:
 # Extractors
 # ---------------------------------------------------------------------------
 
-def _line_of(content: str, match_start: int) -> int:
-    return content.count("\n", 0, match_start) + 1
+def _body_rows(content: str) -> list[TableRow]:
+    """All non-header rows of every table in content."""
+    return [row for table in parse_tables(content) for row in table if not row.is_header]
 
 
 def extract_sec1_quality_tags(content: str) -> set[str]:
-    """Q42 tags from the Section 1.2 quality goals table (second column)."""
+    """Q42 tags from the Section 1.2 quality goals table (second column).
+
+    Any tag in the cell counts, so '#reliable Reliability' and
+    'Reliability (#reliable)' both work.
+    """
     tags: set[str] = set()
-    for m in re.finditer(r"^\|\s*\d+\s*\|\s*(#\w+)", content, re.MULTILINE):
-        tags.add(m.group(1))
+    for row in _body_rows(content):
+        if len(row.cells) >= 2 and re.fullmatch(r"\d+", row.cells[0]):
+            tags.update(re.findall(r"(?<!\w)#\w+", row.cells[1]))
     return tags
 
 
 def extract_sec3_interfaces(content: str) -> dict[str, int]:
     """IF-xx IDs from Section 3 interface table (first column)."""
     result: dict[str, int] = {}
-    for m in re.finditer(r"^\|\s*(IF-\d+)\s*\|", content, re.MULTILINE):
-        if_id = m.group(1)
-        if if_id not in result:
-            result[if_id] = _line_of(content, m.start())
+    for row in _body_rows(content):
+        if row.cells and re.fullmatch(r"IF-\d+", row.cells[0]):
+            result.setdefault(row.cells[0], row.line)
     return result
 
 
@@ -197,43 +445,24 @@ def extract_sec5_data(content: str, lang: dict) -> tuple[dict[str, int], set[str
     """IF-xx IDs and component names from Section 5 building block table.
 
     Only extracts from the specific building-block table (the one whose header
-    row matches the language-specific name-column label), ignoring any other
-    3-column tables that may appear in the section.
+    row's first cell matches the language-specific name-column label), ignoring
+    any other tables that may appear in the section.
     """
     interfaces: dict[str, int] = {}
     names: set[str] = set()
     header_names = lang["patterns"]["section5_header_names"]
 
-    in_bb_table = False
-    for line_num, line in enumerate(content.splitlines(), start=1):
-        if not line.strip().startswith("|"):
-            if in_bb_table:
-                in_bb_table = False
+    for table in parse_tables(content):
+        header = table[0]
+        if len(header.cells) < 3 or not _matches_any(header.cells[0], header_names):
             continue
-
-        cells = [c.strip() for c in line.split("|")[1:-1]]
-        if len(cells) < 3:
-            continue
-
-        name_cell = cells[0]
-        iface_cell = cells[2]
-
-        # Separator row
-        if re.match(r"^[-:\s]+$", name_cell):
-            continue
-
-        # Header row — marks the start of the building-block table
-        if _matches_any(name_cell, header_names):
-            in_bb_table = True
-            continue
-
-        if not in_bb_table or not name_cell:
-            continue
-
-        names.add(name_cell)
-        for if_id in re.findall(r"IF-\d+", iface_cell):
-            if if_id not in interfaces:
-                interfaces[if_id] = line_num
+        for row in table[1:]:
+            name, iface_cell = row.cells[0], row.cells[2]
+            if not name:
+                continue
+            names.add(name)
+            for if_id in re.findall(r"IF-\d+", iface_cell):
+                interfaces.setdefault(if_id, row.line)
 
     return interfaces, names
 
@@ -297,19 +526,19 @@ def extract_sec10_data(content: str, lang: dict) -> tuple[dict[str, str], set[st
             if tag_m:
                 quality_tags[current_qs] = tag_m.group(1)
 
-        # Aspirational row: | QS-xx | description | <not measured> | target | ... |
-        asp_row = re.match(r"^\|\s*(QS-\d+)\s*\|([^|]*)\|\s*([^|]+)\|", line)
-        if asp_row:
-            current_state = asp_row.group(3).strip()
-            if _matches_any(current_state, not_measured_values):
-                aspirational.add(asp_row.group(1))
+    # Aspirational row: | QS-xx | description | <not measured> | target | ... |
+    for row in _body_rows(content):
+        if len(row.cells) >= 3 and re.fullmatch(r"QS-\d+", row.cells[0]) \
+                and _matches_any(row.cells[2], not_measured_values):
+            aspirational.add(row.cells[0])
 
     return quality_tags, aspirational
 
 
 def extract_sec11_risks(content: str) -> set[str]:
     """RISK-xx IDs from Section 11 risk matrix (first column)."""
-    return set(re.findall(r"^\|\s*(RISK-\d+)\s*\|", content, re.MULTILINE))
+    return {row.cells[0] for row in _body_rows(content)
+            if row.cells and re.fullmatch(r"RISK-\d+", row.cells[0])}
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +822,17 @@ def main() -> None:
         "--strict", action="store_true",
         help="Treat warnings as errors (non-zero exit)",
     )
+    parser.add_argument(
+        "--parser", choices=["auto", PARSER_MARKDOWN_IT, PARSER_BUILTIN], default="auto",
+        dest="table_parser",
+        help="Markdown table reader: markdown-it-py if installed ('auto'), or force one",
+    )
     args = parser.parse_args()
+
+    try:
+        table_parser = set_parser(args.table_parser)
+    except RuntimeError as exc:
+        parser.error(f"--parser {args.table_parser}: {exc}")
 
     script_path = Path(__file__).resolve()
     lang = load_language(args.lang, script_path)
@@ -615,7 +854,7 @@ def main() -> None:
 
     issues = run_all_rules(data)
 
-    lang_name = lang.get("name", args.lang)
+    lang_name = f"{lang.get('name', args.lang)}, {table_parser}"
     if args.format == "github":
         output = format_github(issues)
     else:
