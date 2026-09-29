@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -243,6 +245,45 @@ class DiagramTests(unittest.TestCase):
         self.assertEqual(missing, ["diagrams/missing.puml"])
 
 
+class AdrFileTests(unittest.TestCase):
+    def test_adr_file_names_are_not_sections(self):
+        for name, expected in [("adr-5-use-a-cache.md", None), ("ADR-007.md", None),
+                               ("0005-use-a-cache.md", None), ("05-building-blocks.md", 5),
+                               ("readme.md", None), ("09-architecture-decisions.md", 9)]:
+            with self.subTest(name=name):
+                self.assertEqual(lint._section_from_filename(Path(name)), expected)
+
+    def test_sec9_subheadings_stay_inside_adr(self):
+        doc = (
+            "## ADR-001: Queue\n### Implications\n- Risks created: RISK-01\n"
+            "## ADR-002: Events\n**Implications:**\n- Risks created: RISK-02, RISK-03\n"
+            "## Errata\n- Risks created: RISK-09\n"
+        )
+        self.assertEqual(lint.extract_sec9_adr_risks(doc, LANG),
+                         {"ADR-001": ["RISK-01"], "ADR-002": ["RISK-02", "RISK-03"]})
+
+    def test_adr_file_without_adr_heading(self):
+        doc = "# 5. Use a cache\n\n## Consequences\n- Risks created: RISK-05\n"
+        self.assertEqual(lint.extract_adr_file_risks(doc, LANG, "ADR-005"), {"ADR-005": ["RISK-05"]})
+
+    def test_linked_adr_files(self):
+        sec9 = (
+            "| [ADR-001](decisions/ADR-001.md) | x |\n"
+            "| [Use a cache](decisions/adr-5-use-a-cache.md) | x |\n"
+            "| [Record decisions](adr/0001-record-decisions.md#context) | x |\n"
+            "See [Section 11](11-risks.md), [the guide](guide.md) and [web](https://x.io/ADR-9.md).\n"
+        )
+        links = lint._linked_adr_files(sec9, Path("docs/09-decisions.md"))
+        self.assertEqual(
+            {target: (str(path), hint) for target, (path, hint) in links.items()},
+            {
+                "decisions/ADR-001.md": ("docs/decisions/ADR-001.md", "ADR-001"),
+                "decisions/adr-5-use-a-cache.md": ("docs/decisions/adr-5-use-a-cache.md", ""),
+                "adr/0001-record-decisions.md": ("docs/adr/0001-record-decisions.md", ""),
+            },
+        )
+
+
 class EndToEndTests(unittest.TestCase):
     def run_lint(self, fixture: str, parser: str) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -302,6 +343,40 @@ class EndToEndTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1)
                     self.assertEqual(result.stdout.splitlines(), expected)
                     self.assertEqual(result.stderr, "")
+
+    def test_adr_files(self):
+        decisions = FIXTURES / "adr-files" / "decisions"
+        title = lint.RULE_DESCRIPTIONS["RULE-4"]
+        for parser in PARSERS:
+            with self.subTest(parser=parser):
+                result = self.run_lint("adr-files", parser)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr, "")  # adr-5-use-a-cache.md is not a second Section 5
+                self.assertEqual(result.stdout.splitlines(), [
+                    f"::error file={decisions / 'ADR-002.md'},title={title}::RISK-99 referenced in "
+                    "ADR-002 (Section 9 'Risks created') but not found in Section 11 risk matrix",
+                    f"::error file={decisions / 'ADR-003.md'},title={title}::RISK-98 referenced in "
+                    "ADR-003 (Section 9 'Risks created') but not found in Section 11 risk matrix",
+                ])
+
+    def test_adr_files_missing_is_not_a_silent_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            docs = Path(tmp) / "docs"
+            shutil.copytree(FIXTURES / "adr-files", docs)
+            shutil.rmtree(docs / "decisions")
+            for strict, code in (([], 0), (["--strict"], 1)):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), str(docs), "--format", "github", *strict],
+                    capture_output=True, text=True, cwd=ROOT,
+                )
+                with self.subTest(strict=bool(strict)):
+                    self.assertEqual(result.returncode, code)
+                    lines = result.stdout.splitlines()
+                    self.assertEqual(len(lines), 4)
+                    self.assertTrue(all(l.startswith("::warning ") for l in lines))
+                    self.assertIn("ADR file 'decisions/ADR-001.md' linked from Section 9 not found", lines[0])
+                    self.assertIn("Section 9 names 3 ADR(s) (ADR-001, ADR-002, ADR-005) "
+                                  "but no ADR body was found", lines[3])
 
     def test_without_markdown_it(self):
         # -S skips site-packages, so markdown-it-py is unavailable even if installed

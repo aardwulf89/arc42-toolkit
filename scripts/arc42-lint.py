@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -125,6 +126,8 @@ def detect_section(path: Path, content: str, lang: dict) -> int | None:
 
 
 def _section_from_filename(path: Path) -> int | None:
+    if re.match(r"adr(?![a-z])", path.stem, re.IGNORECASE):  # adr-5-title.md is an ADR, not Section 5
+        return None
     m = re.search(r"(?<!\d)(1[0-2]|0?[1-9])(?!\d)", path.stem)
     return int(m.group(1)) if m else None
 
@@ -421,6 +424,9 @@ class SectionData:
     sec7_diagram_text:    str                  = ""
     sec7_missing_diagrams: list[str]           = field(default_factory=list)
     sec9_adr_risks:       dict[str, list[str]] = field(default_factory=dict)
+    sec9_adr_paths:       dict[str, str]       = field(default_factory=dict)
+    sec9_listed_adrs:     set[str]             = field(default_factory=set)
+    sec9_missing_adr_files: list[str]          = field(default_factory=list)
     sec10_quality_tags:   dict[str, str]       = field(default_factory=dict)
     sec10_aspirational:   set[str]             = field(default_factory=set)
     sec11_risks:          set[str]             = field(default_factory=set)
@@ -502,22 +508,26 @@ def extract_sec5_data(content: str, lang: dict) -> tuple[dict[str, int], set[str
 def extract_sec9_adr_risks(content: str, lang: dict) -> dict[str, list[str]]:
     """Map ADR_ID → [RISK_IDs] from Section 9 ADR Implications blocks.
 
-    Any heading resets the current ADR context so stray 'risks created'
-    references after the last ADR are never mis-attributed.
+    A heading at the ADR heading's level or above ends the current ADR, so
+    stray 'risks created' references after the last ADR are never
+    mis-attributed; deeper headings (e.g. '### Implications') stay inside it.
     The trailing colon in ADR headings is optional (## ADR-001 Title works).
     """
     result: dict[str, list[str]] = {}
     current_adr: str | None = None
+    adr_level = 0
     risks_labels = lang["patterns"]["risks_created_label"]
 
     for line in content.splitlines():
-        heading_m = re.match(r"^#{1,3}\s+(.+)$", line)
+        heading_m = re.match(r"^(#{1,6})\s+(.+)$", line)
         if heading_m:
-            adr_m = re.search(r"(ADR-\d+)", heading_m.group(1))
-            if adr_m:
+            level = len(heading_m.group(1))
+            adr_m = re.search(r"(ADR-\d+)", heading_m.group(2))
+            if adr_m and level <= 3:
                 current_adr = adr_m.group(1)
+                adr_level = level
                 result.setdefault(current_adr, [])
-            else:
+            elif level <= adr_level:
                 current_adr = None
             continue
 
@@ -525,6 +535,24 @@ def extract_sec9_adr_risks(content: str, lang: dict) -> dict[str, list[str]]:
             result[current_adr].extend(re.findall(r"RISK-\d+", line))
 
     return result
+
+
+def extract_adr_file_risks(content: str, lang: dict, fallback_id: str) -> dict[str, list[str]]:
+    """Map ADR_ID → [RISK_IDs] for a file holding ADRs outside Section 9.
+
+    A file with several ADR headings is read like Section 9. A file with one
+    ADR (or none, e.g. adr-tools' '# 1. Record decisions') is a single ADR:
+    every 'risks created' line counts, and the ID comes from its heading or,
+    failing that, from fallback_id.
+    """
+    headed = extract_sec9_adr_risks(content, lang)
+    if len(headed) > 1:
+        return headed
+    adr_id = next(iter(headed), fallback_id)
+    labels = lang["patterns"]["risks_created_label"]
+    risks = [risk for line in content.splitlines() if _matches_any(line, labels)
+             for risk in re.findall(r"RISK-\d+", line)]
+    return {adr_id: risks}
 
 
 def extract_sec10_data(content: str, lang: dict) -> tuple[dict[str, str], set[str]]:
@@ -582,12 +610,90 @@ def load_docs(docs_path: Path, lang: dict) -> SectionData:
     data = SectionData()
 
     md_files = [docs_path] if docs_path.is_file() else sorted(docs_path.rglob("*.md"))
-    for path in md_files:
-        content = path.read_text(encoding="utf-8", errors="replace")
-        for sec_num, sec_content, offset in section_windows(path, content, lang):
+    contents = {path: _read(path) for path in md_files}
+
+    # ADR files are kept out of section detection: ADR-001.md or adr-5-title.md
+    # must not be mistaken for a section. They are found by their first heading
+    # and by the links in Section 9 (e.g. a decision log linking each ID to its file).
+    adr_hints = {path: "" for path, content in contents.items()
+                 if _section_from_filename(path) is None
+                 and re.match(r"ADR-\d+", _first_heading(content) or "")}
+    windows = {path: section_windows(path, content, lang)
+               for path, content in contents.items() if path not in adr_hints}
+
+    for path, file_windows in list(windows.items()):
+        for sec_num, sec_content, _ in file_windows:
+            if sec_num != 9:
+                continue
+            for target, (adr_path, hint) in _linked_adr_files(sec_content, path).items():
+                if not adr_path.is_file():
+                    data.sec9_missing_adr_files.append(target)
+                    continue
+                if adr_path not in contents:
+                    contents[adr_path] = _read(adr_path)
+                adr_hints[adr_path] = adr_hints.get(adr_path) or hint
+                windows.pop(adr_path, None)
+
+    for path, file_windows in windows.items():
+        for sec_num, sec_content, offset in file_windows:
             _populate(data, sec_num, sec_content, str(path), lang, offset)
 
+    for path in sorted(adr_hints):
+        fallback_id = adr_hints[path] or path.stem
+        for adr_id, risks in extract_adr_file_risks(contents[path], lang, fallback_id).items():
+            data.sec9_adr_risks.setdefault(adr_id, []).extend(risks)
+            data.sec9_adr_paths.setdefault(adr_id, str(path))
+
     return data
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _first_heading(content: str) -> str | None:
+    """Text of the first ATX heading outside fenced code, or None."""
+    fence: str | None = None
+    for line in content.splitlines():
+        in_code = fence is not None
+        fence = _update_fence(line, fence)
+        if in_code or fence is not None:
+            continue
+        m = re.match(r"^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+_MD_LINK_RE = re.compile(
+    r"\[([^\[\]]*)\]\(\s*<?([^()\s<>]+?\.md)(?:#[^()\s<>]*)?>?(?:\s+\"[^\"]*\")?\s*\)",
+    re.IGNORECASE,
+)
+_ADR_REF_RE = re.compile(r"(?<![a-z])adr[-_ ]?0*(\d+)(?!\d)", re.IGNORECASE)
+
+
+def _linked_adr_files(content: str, src: Path) -> dict[str, tuple[Path, str]]:
+    """Local .md files linked from Section 9 that hold ADRs.
+
+    A link counts when its text or file name names an ADR ('ADR-007',
+    'adr-7-cache.md') or the file name follows the numbered adr-tools/MADR
+    scheme ('0007-use-a-cache.md'). Returns {link target: (path, ADR ID hint)};
+    the hint is the ADR ID as written in the link text, if any.
+    """
+    result: dict[str, tuple[Path, str]] = {}
+    for m in _MD_LINK_RE.finditer(content):
+        text, target = m.group(1), m.group(2)
+        if "://" in target:
+            continue
+        stem = Path(target).stem
+        if not (_ADR_REF_RE.search(text) or _ADR_REF_RE.search(stem) or re.match(r"\d{3,}-", stem)):
+            continue
+        path = Path(os.path.normpath(src.parent / unquote(target)))
+        if path == Path(os.path.normpath(src)):
+            continue
+        hint = re.search(r"ADR-\d+", text)
+        result.setdefault(target, (path, hint.group() if hint else ""))
+    return result
 
 
 # Text-based diagram sources that may name building blocks (PlantUML, Mermaid)
@@ -622,7 +728,7 @@ def _populate(data: SectionData, sec: int, content: str, src: str, lang: dict,
         1: data.sec1_path, 3: data.sec3_path, 5: data.sec5_path,
         7: data.sec7_path, 9: data.sec9_path, 10: data.sec10_path, 11: data.sec11_path,
     }.get(sec)
-    if existing_path:
+    if existing_path and sec != 9:  # Section 9 data is merged, not replaced
         print(
             f"arc42-lint: warning: Section {sec} detected in both '{existing_path}' and '{src}'"
             f" — data from '{src}' will be used.",
@@ -644,7 +750,10 @@ def _populate(data: SectionData, sec: int, content: str, src: str, lang: dict,
         data.sec7_path = src
         data.sec7_diagram_text, data.sec7_missing_diagrams = _referenced_diagrams(content, src)
     elif sec == 9:
-        data.sec9_adr_risks = extract_sec9_adr_risks(content, lang)
+        for adr_id, risks in extract_sec9_adr_risks(content, lang).items():
+            data.sec9_adr_risks.setdefault(adr_id, []).extend(risks)
+            data.sec9_adr_paths.setdefault(adr_id, src)
+        data.sec9_listed_adrs.update(re.findall(r"ADR-\d+", content))
         data.sec9_path = src
     elif sec == 10:
         data.sec10_quality_tags, data.sec10_aspirational = extract_sec10_data(content, lang)
@@ -747,21 +856,39 @@ def rule_quality_tag_coverage(data: SectionData) -> list[LintIssue]:
 
 
 def rule_adr_risks_in_register(data: SectionData) -> list[LintIssue]:
-    """Rule 4: Every RISK-xx in a Section 9 ADR 'Risks created' must exist in Section 11."""
-    issues: list[LintIssue] = []
+    """Rule 4: Every RISK-xx in a Section 9 ADR 'Risks created' must exist in Section 11.
+
+    ADRs are read from Section 9 itself and from ADR files (one per ADR, linked
+    from Section 9 or headed '## ADR-xxx'). If Section 9 names ADRs but no ADR
+    body is found anywhere, the rule warns rather than passing unchecked.
+    """
+    issues: list[LintIssue] = [
+        LintIssue("RULE-4", "warning", data.sec9_path, -1,
+                  f"ADR file '{target}' linked from Section 9 not found; its risk references were not checked")
+        for target in data.sec9_missing_adr_files
+    ]
 
     if not data.sec9_adr_risks:
+        if data.sec9_listed_adrs:
+            ids = sorted(data.sec9_listed_adrs, key=lambda i: int(i.split("-")[1]))
+            listed = ", ".join(ids[:3]) + (", …" if len(ids) > 3 else "")
+            issues.append(LintIssue(
+                "RULE-4", "warning", data.sec9_path, -1,
+                f"Section 9 names {len(ids)} ADR(s) ({listed}) but no ADR body was found "
+                f"(no '## ADR-xxx' heading in Section 9, no linked ADR files); "
+                f"cannot verify ADR risk references",
+            ))
         return issues
 
     if not data.sec11_risks and not data.sec11_content:
-        return [LintIssue("RULE-4", "warning", data.sec9_path, -1,
-                          "Section 11 not found; cannot verify ADR risk references")]
+        return issues + [LintIssue("RULE-4", "warning", data.sec9_path, -1,
+                                   "Section 11 not found; cannot verify ADR risk references")]
 
     for adr_id, risk_ids in sorted(data.sec9_adr_risks.items()):
         for risk_id in sorted(risk_ids):
             if risk_id not in data.sec11_risks:
                 issues.append(LintIssue(
-                    "RULE-4", "error", data.sec9_path, -1,
+                    "RULE-4", "error", data.sec9_adr_paths.get(adr_id, data.sec9_path), -1,
                     f"{risk_id} referenced in {adr_id} (Section 9 'Risks created') "
                     f"but not found in Section 11 risk matrix",
                 ))
@@ -909,8 +1036,8 @@ def main() -> None:
 
     if not any([
         data.sec1_quality_tags, data.sec3_interfaces, data.sec5_interfaces,
-        data.sec7_content, data.sec9_adr_risks, data.sec10_quality_tags,
-        data.sec11_risks,
+        data.sec7_content, data.sec9_adr_risks, data.sec9_listed_adrs,
+        data.sec9_missing_adr_files, data.sec10_quality_tags, data.sec11_risks,
     ]):
         print(f"arc42-lint: no arc42 sections detected in '{docs}' — nothing to lint.")
         sys.exit(0)

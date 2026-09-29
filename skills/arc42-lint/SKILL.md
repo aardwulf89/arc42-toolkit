@@ -78,7 +78,7 @@ Read the relevant documentation sections. Apply each rule in order. The phrases 
 3. Any tag used in Section 10 that does not appear in Section 1.2 is an error
 
 **Rule 4 — Section 9 ↔ Section 11 ADR Risk References**
-1. Read Section 9: for each ADR, find the `Risks created (→ Section 11):` line in its Implications block; collect all `RISK-xx` IDs mentioned
+1. Read Section 9: for each ADR, find the `Risks created (→ Section 11):` line in its Implications block; collect all `RISK-xx` IDs mentioned. If ADRs live in their own files (e.g. Section 9's decision log links to `decisions/ADR-001.md`), read every linked ADR file too. If Section 9 names ADRs but no ADR body can be found, report that the rule could not be checked — do not report a pass
 2. Read Section 11: collect every `RISK-xx` from the risk matrix (ID column)
 3. Any toolkit RISK-xx mentioned in Section 9 but absent from Section 11 is a toolkit convention deviation
 

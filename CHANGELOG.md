@@ -30,6 +30,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). Eac
 | `scripts/arc42-lint.py` | Line numbers for single-file docs refer to the file, not the section |
 | `scripts/arc42-lint.py` | Rule 2 also searches local PlantUML/Mermaid diagrams linked from Section 7 (and warns when a linked diagram is missing); names ending in punctuation such as `Gateway (v2)` or split across lines now match |
 | `scripts/arc42-lint.py` | Rule 5 matches scenario IDs exactly, so `QS-10` no longer counts as a reference to `QS-1` |
+| `scripts/arc42-lint.py` | Rule 4 reads ADRs kept one per file: files linked from Section 9 (e.g. a decision log) and files headed `## ADR-xxx` are collected and merged, and errors point at the ADR file. Previously such ADRs were ignored and Rule 4 passed silently |
+| `scripts/arc42-lint.py` | Rule 4 warns when Section 9 names ADRs but no ADR body is found, and when a linked ADR file is missing |
+| `scripts/arc42-lint.py` | ADR files (`ADR-007.md`, `adr-5-title.md`) are no longer mistaken for arc42 sections by their file name or heading |
+| `scripts/arc42-lint.py` | Sub-headings inside an ADR (e.g. `### Implications`) no longer end the ADR, so its `Risks created` line is still read |
+| `skills/arc42-lint` | Manual Rule 4 check covers ADRs kept in separate files and no longer treats "no ADRs found" as a pass |
 
 ### Added
 
