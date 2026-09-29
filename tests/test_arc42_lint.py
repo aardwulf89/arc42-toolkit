@@ -185,6 +185,64 @@ class ExtractorTests(unittest.TestCase):
                 self.assertEqual(risks, {"RISK-01", "RISK-02"})
 
 
+class SectionSplitTests(unittest.TestCase):
+    def windows(self, content: str, name: str = "arc42.md") -> list[tuple[int, int]]:
+        return [(sec, offset) for sec, _, offset in lint.section_windows(Path(name), content, LANG)]
+
+    def test_monolithic_split_keeps_subsections(self):
+        doc = (
+            "# Title\n\n# 1. Introduction and Goals\n## 1.2 Quality Goals\n"
+            "# 5. Building Block View\n## 5.1 Whitebox\n## 5.2 Level 2\n"
+            "## Deployment view notes\n"  # sub-heading keyword for another section
+            "```bash\n# 7. comment\n```\n# 7. Deployment View\n"
+        )
+        self.assertEqual(self.windows(doc), [(1, 2), (5, 4), (7, 11)])
+
+    def test_sections_at_level_two(self):
+        doc = "# Shop\n## Introduction and Goals\ntext\n## Context and Scope\n"
+        self.assertEqual(self.windows(doc), [(1, 1), (3, 3)])
+
+    def test_single_section_files(self):
+        self.assertEqual(self.windows("# 1. Intro\n## 3 things\n", "05-bbv.md"), [(5, 0)])
+        self.assertEqual(self.windows("# 5. Building Block View\n## 5.1 Whitebox\n"), [(5, 0)])
+        self.assertEqual(self.windows("no headings\n"), [])
+
+
+class RuleTests(unittest.TestCase):
+    def test_rule2_name_matching(self):
+        data = lint.SectionData(
+            sec5_component_names={"Gateway (v2)", "Order Service", "C++ Core", "Label Printer", "Api"},
+            sec7_content="Gateway (v2) and the Order\nService run; C++ Core too. See the API docs.",
+            sec7_diagram_text='Container(p, "Label Printer", "CUPS")',
+        )
+        self.assertEqual(lint.rule_component_in_deployment(data), [])
+
+        data.sec5_component_names = {"Order", "Core"}
+        data.sec7_content = "OrderService and Hardcore"
+        data.sec7_diagram_text = ""
+        missing = [i.message for i in lint.rule_component_in_deployment(data)]
+        self.assertEqual(len(missing), 2)
+
+    def test_rule5_exact_ids(self):
+        data = lint.SectionData(sec10_aspirational={"QS-1", "QS-10", "QS-2"},
+                                sec11_content="| RISK-01 | QS-10 and XQS-2 |")
+        flagged = [i.message.split()[2] for i in lint.rule_aspirational_in_risks(data)]
+        self.assertEqual(flagged, ["QS-1", "QS-2"])
+
+
+class DiagramTests(unittest.TestCase):
+    def test_referenced_diagrams(self):
+        src = str(FIXTURES / "formatted" / "07-deployment-view.md")
+        content = (
+            "![Prod](diagrams/deployment-prod.puml) [again](diagrams/deployment-prod.puml)\n"
+            "[Gone](diagrams/missing.puml) [Web](https://example.com/x.puml) [Doc](other.md)\n"
+        )
+        text, missing = lint._referenced_diagrams(content, src)
+        self.assertEqual(text.count("@startuml"), 1)
+        self.assertIn("Label Printer", text)
+        self.assertEqual(missing, ["diagrams/missing.puml"])
+
+
 class EndToEndTests(unittest.TestCase):
     def run_lint(self, fixture: str, parser: str) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -210,6 +268,8 @@ class EndToEndTests(unittest.TestCase):
                 self.assertEqual(messages, [
                     "IF-03 defined in Section 3 but missing from Section 5 building blocks",
                     "IF-04 referenced in Section 5 but not defined in Section 3 interface table",
+                    "Diagram 'diagrams/deployment-staging.puml' linked from Section 7 not found; "
+                    "its contents were not checked",
                     'Building block "Audit Log" (Section 5) not found in Section 7 deployment view',
                     "Q42 tag #secure used in QS-01 (Section 10) but not present in Section 1.2 quality goals",
                     "RISK-09 referenced in ADR-001 (Section 9 'Risks created') but not found in Section 11 risk matrix",
@@ -217,6 +277,31 @@ class EndToEndTests(unittest.TestCase):
                 ])
                 outputs[parser] = result.stdout
         self.assertEqual(len(set(outputs.values())), 1, "readers disagree")
+
+    def test_monolithic_file(self):
+        doc = FIXTURES / "monolithic" / "arc42.md"
+        lines = doc.read_text(encoding="utf-8").splitlines()
+        if02 = next(n for n, l in enumerate(lines, 1) if l.startswith("| IF-02 |"))
+        if03 = next(n for n, l in enumerate(lines, 1) if "| IF-03 |" in l)
+        expected = [
+            f"::error file={doc},line={if02},title={lint.RULE_DESCRIPTIONS['RULE-1']}::"
+            "IF-02 defined in Section 3 but missing from Section 5 building blocks",
+            f"::error file={doc},line={if03},title={lint.RULE_DESCRIPTIONS['RULE-1']}::"
+            "IF-03 referenced in Section 5 but not defined in Section 3 interface table",
+            f"::error file={doc},title={lint.RULE_DESCRIPTIONS['RULE-5']}::"
+            "Aspirational scenario QS-1 (Section 10.3) not referenced in Section 11 risks/debt",
+        ]
+        for parser in PARSERS:
+            for target in (doc.parent, doc):  # directory and single-file invocation
+                with self.subTest(parser=parser, target=target.name):
+                    result = subprocess.run(
+                        [sys.executable, str(SCRIPT), str(target), "--parser", parser,
+                         "--format", "github"],
+                        capture_output=True, text=True, cwd=ROOT,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout.splitlines(), expected)
+                    self.assertEqual(result.stderr, "")
 
     def test_without_markdown_it(self):
         # -S skips site-packages, so markdown-it-py is unavailable even if installed

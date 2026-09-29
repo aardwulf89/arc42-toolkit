@@ -34,6 +34,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote
 
 try:
     from markdown_it import MarkdownIt
@@ -107,9 +108,9 @@ def detect_section(path: Path, content: str, lang: dict) -> int | None:
       2. Numeric prefix in the first heading (language-agnostic)
       3. Keyword match in the first heading (language-specific fallback)
     """
-    m = re.search(r"(?<!\d)(1[0-2]|0?[1-9])(?!\d)", path.stem)
-    if m:
-        return int(m.group(1))
+    sec = _section_from_filename(path)
+    if sec is not None:
+        return sec
 
     for hm in _HEADING_RE.finditer(content):
         heading = hm.group(1)
@@ -123,32 +124,56 @@ def detect_section(path: Path, content: str, lang: dict) -> int | None:
     return None
 
 
-def split_monolithic(content: str, path: Path, lang: dict) -> list[tuple[int, str, Path]]:
-    """Split a monolithic arc42 file into (section_num, content_slice, path) windows."""
-    lines = content.splitlines(keepends=True)
-    segments: list[tuple[int, list[str], Path]] = []
-    current_sec: int | None = None
-    current_lines: list[str] = []
+def _section_from_filename(path: Path) -> int | None:
+    m = re.search(r"(?<!\d)(1[0-2]|0?[1-9])(?!\d)", path.stem)
+    return int(m.group(1)) if m else None
 
-    for line in lines:
-        m = re.match(r"^(#{1,2})\s+(.+)$", line)
-        if m:
+
+def split_monolithic(content: str, lang: dict) -> list[tuple[int, str, int]]:
+    """Split a monolithic arc42 file into (section_num, content_slice, line_offset) windows.
+
+    Only headings at the level of the first section heading start a new window,
+    so subsections ('## 5.1 ...' under '# 5. ...') stay with their section.
+    Consecutive windows for the same section are merged, and headings inside
+    fenced code blocks are ignored. line_offset is the 0-based index of the
+    window's first line in content.
+    """
+    segments: list[tuple[int, int, list[str]]] = []
+    level: int | None = None
+    fence: str | None = None
+
+    for idx, line in enumerate(content.splitlines(keepends=True)):
+        in_code = fence is not None
+        fence = _update_fence(line, fence)
+        m = None if in_code or fence is not None else re.match(r"^(#{1,2})\s+(.+)$", line)
+        if m and (level is None or len(m.group(1)) == level):
             heading = m.group(2)
             sec = _section_from_number(heading)
             if sec is None:
                 sec = _section_from_keyword(heading, lang["section_keywords"])
             if sec is not None:
-                if current_sec is not None:
-                    segments.append((current_sec, current_lines, path))
-                current_sec = sec
-                current_lines = [line]
-                continue
-        current_lines.append(line)
+                level = len(m.group(1))
+                if not segments or segments[-1][0] != sec:
+                    segments.append((sec, idx, []))
+        if segments:
+            segments[-1][2].append(line)
 
-    if current_sec is not None:
-        segments.append((current_sec, current_lines, path))
+    return [(sec, "".join(lines), offset) for sec, offset, lines in segments]
 
-    return [(sec, "".join(lines_), p) for sec, lines_, p in segments]
+
+def section_windows(path: Path, content: str, lang: dict) -> list[tuple[int, str, int]]:
+    """Return the (section_num, content, line_offset) windows a file contributes.
+
+    A file named after a section (e.g. 05-building-blocks.md) is that section.
+    Otherwise a file whose headings cover two or more sections is split;
+    anything else is classified by its first recognisable heading.
+    """
+    if _section_from_filename(path) is None:
+        windows = split_monolithic(content, lang)
+        if len({sec for sec, _, _ in windows}) > 1:
+            return windows
+    sec = detect_section(path, content, lang)
+    return [(sec, content, 0)] if sec is not None else []
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +271,17 @@ _BLOCK_START_RE = re.compile(
 )
 
 
+def _update_fence(line: str, fence: str | None) -> str | None:
+    """Track fenced code blocks: return the fence still open after this line."""
+    m = _FENCE_RE.match(line)
+    if fence is None:
+        return m.group(1) if m else None
+    if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+            and not line.strip().lstrip(fence[0]):
+        return None
+    return fence
+
+
 def _indent(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
@@ -276,15 +312,9 @@ def _tables_builtin(content: str) -> list[list[TableRow]]:
     while i < len(lines):
         line = lines[i]
 
-        fence_m = _FENCE_RE.match(line)
-        if fence is not None:
-            if fence_m and fence_m.group(1)[0] == fence[0] and len(fence_m.group(1)) >= len(fence) \
-                    and not line.strip().lstrip(fence[0]):
-                fence = None
-            i += 1
-            continue
-        if fence_m:
-            fence = fence_m.group(1)
+        in_code = fence is not None
+        fence = _update_fence(line, fence)
+        if in_code or fence is not None:
             i += 1
             continue
 
@@ -388,6 +418,8 @@ class SectionData:
     sec5_component_names: set[str]             = field(default_factory=set)
     sec7_content:         str | None           = None
     sec7_path:            str                  = ""
+    sec7_diagram_text:    str                  = ""
+    sec7_missing_diagrams: list[str]           = field(default_factory=list)
     sec9_adr_risks:       dict[str, list[str]] = field(default_factory=dict)
     sec10_quality_tags:   dict[str, str]       = field(default_factory=dict)
     sec10_aspirational:   set[str]             = field(default_factory=set)
@@ -546,34 +578,46 @@ def extract_sec11_risks(content: str) -> set[str]:
 # ---------------------------------------------------------------------------
 
 def load_docs(docs_path: Path, lang: dict) -> SectionData:
-    """Read all .md files under docs_path and populate SectionData."""
+    """Read docs_path (a single file, or all .md files below a directory) into SectionData."""
     data = SectionData()
 
-    md_files = sorted(docs_path.rglob("*.md"))
-    if not md_files:
-        return data
-
+    md_files = [docs_path] if docs_path.is_file() else sorted(docs_path.rglob("*.md"))
     for path in md_files:
         content = path.read_text(encoding="utf-8", errors="replace")
-        rel = str(path)
-
-        sec = detect_section(path, content, lang)
-        windows: list[tuple[int, str, str]] = []
-
-        if sec is not None:
-            windows = [(sec, content, rel)]
-        else:
-            splits = split_monolithic(content, path, lang)
-            if splits:
-                windows = [(s, c, rel) for s, c, _ in splits]
-
-        for sec_num, sec_content, src in windows:
-            _populate(data, sec_num, sec_content, src, lang)
+        for sec_num, sec_content, offset in section_windows(path, content, lang):
+            _populate(data, sec_num, sec_content, str(path), lang, offset)
 
     return data
 
 
-def _populate(data: SectionData, sec: int, content: str, src: str, lang: dict) -> None:
+# Text-based diagram sources that may name building blocks (PlantUML, Mermaid)
+_DIAGRAM_LINK_RE = re.compile(
+    r"\]\(\s*<?([^()\s<>]+\.(?:puml|plantuml|pu|iuml|wsd|mmd|mermaid))>?(?:\s+\"[^\"]*\")?\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _referenced_diagrams(content: str, src: str) -> tuple[str, list[str]]:
+    """Read local diagram files linked from content, resolved relative to src.
+
+    Returns (combined diagram text, list of links whose file does not exist).
+    Literal '\\n' line breaks in diagram labels are read as spaces.
+    """
+    texts: list[str] = []
+    missing: list[str] = []
+    for target in dict.fromkeys(m.group(1) for m in _DIAGRAM_LINK_RE.finditer(content)):
+        if "://" in target:
+            continue
+        path = Path(src).parent / unquote(target.split("#", 1)[0])
+        if path.is_file():
+            texts.append(path.read_text(encoding="utf-8", errors="replace").replace("\\n", " "))
+        else:
+            missing.append(target)
+    return "\n".join(texts), missing
+
+
+def _populate(data: SectionData, sec: int, content: str, src: str, lang: dict,
+              line_offset: int = 0) -> None:
     existing_path = {
         1: data.sec1_path, 3: data.sec3_path, 5: data.sec5_path,
         7: data.sec7_path, 9: data.sec9_path, 10: data.sec10_path, 11: data.sec11_path,
@@ -589,14 +633,16 @@ def _populate(data: SectionData, sec: int, content: str, src: str, lang: dict) -
         data.sec1_quality_tags = extract_sec1_quality_tags(content)
         data.sec1_path = src
     elif sec == 3:
-        data.sec3_interfaces = extract_sec3_interfaces(content)
+        data.sec3_interfaces = _shift_lines(extract_sec3_interfaces(content), line_offset)
         data.sec3_path = src
     elif sec == 5:
-        data.sec5_interfaces, data.sec5_component_names = extract_sec5_data(content, lang)
+        interfaces, data.sec5_component_names = extract_sec5_data(content, lang)
+        data.sec5_interfaces = _shift_lines(interfaces, line_offset)
         data.sec5_path = src
     elif sec == 7:
         data.sec7_content = content
         data.sec7_path = src
+        data.sec7_diagram_text, data.sec7_missing_diagrams = _referenced_diagrams(content, src)
     elif sec == 9:
         data.sec9_adr_risks = extract_sec9_adr_risks(content, lang)
         data.sec9_path = src
@@ -607,6 +653,11 @@ def _populate(data: SectionData, sec: int, content: str, src: str, lang: dict) -
         data.sec11_risks = extract_sec11_risks(content)
         data.sec11_content = content
         data.sec11_path = src
+
+
+def _shift_lines(ids: dict[str, int], offset: int) -> dict[str, int]:
+    """Convert window-relative line numbers to file line numbers."""
+    return {key: line + offset for key, line in ids.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +692,12 @@ def rule_interface_consistency(data: SectionData) -> list[LintIssue]:
 
 
 def rule_component_in_deployment(data: SectionData) -> list[LintIssue]:
-    """Rule 2: Every Section 5 building block name must appear in Section 7."""
+    """Rule 2: Every Section 5 building block name must appear in Section 7.
+
+    Section 7 covers its markdown and any local diagram files it links to.
+    Names match as whole words; whitespace inside a name may differ (e.g. a
+    line break in the middle of 'Order Service').
+    """
     issues: list[LintIssue] = []
 
     if not data.sec5_component_names:
@@ -651,9 +707,16 @@ def rule_component_in_deployment(data: SectionData) -> list[LintIssue]:
         return [LintIssue("RULE-2", "warning", data.sec5_path, -1,
                           "Section 7 not found; cannot verify building block deployment coverage")]
 
+    for target in data.sec7_missing_diagrams:
+        issues.append(LintIssue(
+            "RULE-2", "warning", data.sec7_path, -1,
+            f"Diagram '{target}' linked from Section 7 not found; its contents were not checked",
+        ))
+
+    sec7_text = data.sec7_content + "\n" + data.sec7_diagram_text
     for name in sorted(data.sec5_component_names):
-        pattern = r"\b" + re.escape(name) + r"\b"
-        if not re.search(pattern, data.sec7_content, re.IGNORECASE):
+        pattern = r"(?<!\w)" + r"\s+".join(map(re.escape, name.split())) + r"(?!\w)"
+        if not re.search(pattern, sec7_text, re.IGNORECASE):
             issues.append(LintIssue(
                 "RULE-2", "error", data.sec5_path, -1,
                 f'Building block "{name}" (Section 5) not found in Section 7 deployment view',
@@ -717,7 +780,7 @@ def rule_aspirational_in_risks(data: SectionData) -> list[LintIssue]:
                           "Section 11 not found; cannot verify aspirational scenario traceability")]
 
     for qs_id in sorted(data.sec10_aspirational):
-        if qs_id not in data.sec11_content:
+        if not re.search(r"(?<![\w-])" + re.escape(qs_id) + r"(?!\d)", data.sec11_content):
             issues.append(LintIssue(
                 "RULE-5", "error", data.sec10_path, -1,
                 f"Aspirational scenario {qs_id} (Section 10.3) not referenced in Section 11 risks/debt",

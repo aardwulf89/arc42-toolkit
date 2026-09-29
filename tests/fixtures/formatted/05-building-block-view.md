@@ -7,6 +7,7 @@
 | `Order Service` | Accepts and validates orders | `IF-01` |
 | **Fulfilment Gateway** | Hands orders to the warehouse | [IF-02](#if-02) |
 | Name Registry | Resolves service names | — |
+| Label Printer | Prints shipping labels | — |
 
 ## 5.2 Level 2
 

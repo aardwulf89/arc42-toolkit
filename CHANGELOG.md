@@ -26,6 +26,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). Eac
 | `scripts/arc42-lint.py` | Section 1.2 tags are found anywhere in the goal cell (e.g. `Reliability (#reliable)`), not only at its start |
 | `scripts/arc42-lint.py` | Tables inside fenced code blocks are ignored; escaped pipes (`\|`) no longer split cells |
 | `scripts/arc42-lint.py` | Section 5 building block rows whose name contains a header keyword (e.g. `Name Registry`) are no longer mistaken for header rows |
+| `scripts/arc42-lint.py` | Single-file (monolithic) docs are split into sections: previously the whole file was classified by its first numbered heading. Subsections such as `5.1`/`5.2` stay in their section, headings in code blocks are ignored, and a single file can be passed as the docs path |
+| `scripts/arc42-lint.py` | Line numbers for single-file docs refer to the file, not the section |
+| `scripts/arc42-lint.py` | Rule 2 also searches local PlantUML/Mermaid diagrams linked from Section 7 (and warns when a linked diagram is missing); names ending in punctuation such as `Gateway (v2)` or split across lines now match |
+| `scripts/arc42-lint.py` | Rule 5 matches scenario IDs exactly, so `QS-10` no longer counts as a reference to `QS-1` |
 
 ### Added
 
