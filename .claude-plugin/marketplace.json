@@ -7,10 +7,7 @@
   "plugins": [
     {
       "name": "arc42-toolkit",
-      "source": {
-        "source": "github",
-        "repo": "MSiccDev/arc42-toolkit"
-      },
+      "source": "./",
       "description": "Provider-agnostic AI skills for creating professional arc42 software architecture documentation. Covers all 12 arc42 sections plus cross-section quality review.",
       "version": "1.0.0",
       "license": "MIT",
